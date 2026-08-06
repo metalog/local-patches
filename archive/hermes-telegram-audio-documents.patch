@@ -1,0 +1,124 @@
+diff --git a/gateway/platforms/telegram.py b/gateway/platforms/telegram.py
+index aed7b71af..6c5985128 100644
+--- a/gateway/platforms/telegram.py
++++ b/gateway/platforms/telegram.py
+@@ -2346,12 +2346,6 @@ class TelegramAdapter(BasePlatformAdapter):
+             if self._should_attempt_rich(content, metadata=metadata):
+                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
+                 if rich_result is not None:
+-                    if rich_result.success:
+-                        # Re-trigger typing like the legacy success path does.
+-                        try:
+-                            await self.send_typing(chat_id, metadata=metadata)
+-                        except Exception:
+-                            pass  # Typing failures are non-fatal
+                     return rich_result
+ 
+             # Format and split message if needed
+@@ -2569,16 +2563,6 @@ class TelegramAdapter(BasePlatformAdapter):
+                         raise
+                 message_ids.append(str(msg.message_id))
+ 
+-            # Re-trigger typing indicator after sending a message.
+-            # Telegram clears the typing state when a new message is delivered,
+-            # so without this the "...typing" bubble disappears mid-response
+-            # (especially noticeable when the agent sends intermediate progress
+-            # messages like "Checking:" before running tools).
+-            try:
+-                await self.send_typing(chat_id, metadata=metadata)
+-            except Exception:
+-                pass  # Typing failures are non-fatal
+-
+             return SendResult(
+                 success=True,
+                 message_id=message_ids[0] if message_ids else None,
+@@ -5625,6 +5609,14 @@ class TelegramAdapter(BasePlatformAdapter):
+             return MessageType.AUDIO
+         if msg.voice:
+             return MessageType.VOICE
++        if msg.document:
++            doc = msg.document
++            doc_mime = (getattr(doc, "mime_type", "") or "").lower()
++            filename = getattr(doc, "file_name", "") or ""
++            _, ext = os.path.splitext(filename)
++            ext = ext.lower()
++            if doc_mime.startswith("audio/") or SUPPORTED_DOCUMENT_TYPES.get(ext, "").startswith("audio/"):
++                return MessageType.AUDIO
+         return MessageType.DOCUMENT
+ 
+     async def _cache_observed_media(self, msg: Message, event: MessageEvent) -> None:
+diff --git a/tests/gateway/test_telegram_audio_vs_voice.py b/tests/gateway/test_telegram_audio_vs_voice.py
+index 1d1bf0cb7..1653ac97b 100644
+--- a/tests/gateway/test_telegram_audio_vs_voice.py
++++ b/tests/gateway/test_telegram_audio_vs_voice.py
+@@ -12,6 +12,7 @@ These tests confirm that:
+   3. Mixed media lists (voice + audio) split correctly.
+ """
+ 
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -186,3 +187,21 @@ def test_telegram_media_type_detection_audio_vs_voice():
+     assert MessageType.VOICE.value == "voice"
+     # Sanity: they are distinct
+     assert MessageType.AUDIO != MessageType.VOICE
++
++
++def test_telegram_audio_document_is_audio_attachment():
++    """Telegram document uploads with audio MIME/extension should be exposed as audio attachments."""
++    from gateway.platforms.telegram import TelegramAdapter
++
++    msg = SimpleNamespace(
++        sticker=None,
++        photo=None,
++        video=None,
++        audio=None,
++        voice=None,
++        document=SimpleNamespace(file_name="20260619_161944.aac", mime_type="audio/aac"),
++    )
++
++    platform = TelegramAdapter.__new__(TelegramAdapter)
++
++    assert platform._media_message_type(msg) == MessageType.AUDIO
+diff --git a/tests/gateway/test_telegram_rich_messages.py b/tests/gateway/test_telegram_rich_messages.py
+index de635042e..d1d98646a 100644
+--- a/tests/gateway/test_telegram_rich_messages.py
++++ b/tests/gateway/test_telegram_rich_messages.py
+@@ -117,6 +117,17 @@ async def test_rich_happy_path_sends_raw_markdown():
+     adapter._bot.send_message.assert_not_called()
+ 
+ 
++@pytest.mark.asyncio
++async def test_successful_rich_send_does_not_retrigger_typing():
++    """Final rich sends must not leave a fresh Telegram typing action behind."""
++    adapter = _make_adapter()
++
++    result = await adapter.send("12345", RICH_CONTENT)
++
++    assert result.success is True
++    adapter._bot.send_chat_action.assert_not_awaited()
++
++
+ @pytest.mark.asyncio
+ async def test_details_with_math_skips_rich_send_to_avoid_tdesktop_crash():
+     adapter = _make_adapter()
+@@ -243,6 +254,18 @@ async def test_plain_markdown_stays_on_legacy_path():
+     bot.send_message.assert_awaited()
+ 
+ 
++@pytest.mark.asyncio
++async def test_successful_legacy_send_does_not_retrigger_typing():
++    """Final legacy sends must not leave a fresh Telegram typing action behind."""
++    adapter = _make_adapter()
++
++    result = await adapter.send("12345", "Hello **there**\n\nA normal reply.")
++
++    assert result.success is True
++    adapter._bot.send_message.assert_awaited()
++    adapter._bot.send_chat_action.assert_not_awaited()
++
++
+ @pytest.mark.asyncio
+ async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
+     adapter = _make_adapter()

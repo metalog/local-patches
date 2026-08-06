@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAPPLY_SCRIPT="${HOME}/bin/reapply-hermes-local-patches"
+UPDATE_LOG="$(mktemp)"
+cleanup() {
+  rm -f "$UPDATE_LOG"
+}
+trap cleanup EXIT
+
+echo "==> Running hermes update"
+set +e
+hermes update 2>&1 | tee "$UPDATE_LOG"
+update_status=${PIPESTATUS[0]}
+set -e
+if [[ $update_status -ne 0 ]]; then
+  echo >&2
+  echo "hermes update failed with exit code $update_status" >&2
+  exit $update_status
+fi
+
+echo
+echo "==> Reapplying local Hermes patches"
+"$REAPPLY_SCRIPT"
+
+echo
+echo "==> Restarting hermes-gateway via sudo -n"
+sudo -n systemctl restart hermes-gateway
+sudo -n systemctl is-active hermes-gateway >/dev/null
+
+echo
+if grep -q "Failed to restart hermes-gateway" "$UPDATE_LOG" || grep -q "Interactive authentication required" "$UPDATE_LOG"; then
+  echo "Note: built-in restart inside 'hermes update' failed as expected in this setup; wrapper restart via sudo -n succeeded."
+  echo
+fi
+
+echo "Done. Local patches reapplied and hermes-gateway restarted."

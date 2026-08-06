@@ -1,0 +1,49 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index bf5103d1..0b15bf07 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2853,15 +2853,12 @@ class GatewayRunner:
+             )
+ 
+             # Read model + compression config from config.yaml.
+-            # NOTE: hygiene threshold is intentionally HIGHER than the agent's
+-            # own compressor (0.85 vs 0.50).  Hygiene is a safety net for
+-            # sessions that grew too large between turns — it fires pre-agent
+-            # to prevent API failures.  The agent's own compressor handles
+-            # normal context management during its tool loop with accurate
+-            # real token counts.  Having hygiene at 0.50 caused premature
+-            # compression on every turn in long gateway sessions.
++            # Hygiene should never fire later than the main agent compressor,
++            # so it follows compression.threshold from config instead of using
++            # a separate hardcoded percentage. The hard message limit remains
++            # as an earlier safety valve for runaway long-lived sessions.
+             _hyg_model = "anthropic/claude-sonnet-4.6"
+-            _hyg_threshold_pct = 0.85
++            _hyg_threshold_pct = 0.50
+             _hyg_compression_enabled = True
+             _hyg_config_context_length = None
+             _hyg_provider = None
+@@ -2892,14 +2889,20 @@ class GatewayRunner:
+                         _hyg_provider = _model_cfg.get("provider") or None
+                         _hyg_base_url = _model_cfg.get("base_url") or None
+ 
+-                    # Read compression settings — only use enabled flag.
+-                    # The threshold is intentionally separate from the agent's
+-                    # compression.threshold (hygiene runs higher).
++                    # Read compression settings. Hygiene follows the same
++                    # threshold as the main agent compressor so gateway
++                    # sessions never compress later than normal agent turns.
+                     _comp_cfg = _hyg_data.get("compression", {})
+                     if isinstance(_comp_cfg, dict):
+                         _hyg_compression_enabled = str(
+                             _comp_cfg.get("enabled", True)
+                         ).lower() in ("true", "1", "yes")
++                        try:
++                            _hyg_threshold_pct = float(
++                                _comp_cfg.get("threshold", _hyg_threshold_pct)
++                            )
++                        except (TypeError, ValueError):
++                            pass
+ 
+                 # Resolve provider/base_url from runtime if not in config
+                 if not _hyg_provider or not _hyg_base_url:

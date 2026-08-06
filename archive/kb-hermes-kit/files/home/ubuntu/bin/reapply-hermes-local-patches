@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="${HOME}/.hermes/hermes-agent"
+PATCH_SCRIPT="${HOME}/.hermes/local-patches/reapply-patches.py"
+
+if [[ ! -f "$REPO/tools/terminal_tool.py" ]]; then
+  echo "Hermes terminal tool not found: $REPO/tools/terminal_tool.py" >&2
+  exit 1
+fi
+
+if [[ ! -f "$REPO/gateway/run.py" ]]; then
+  echo "Hermes gateway run.py not found: $REPO/gateway/run.py" >&2
+  exit 1
+fi
+
+exec python3 "$PATCH_SCRIPT"

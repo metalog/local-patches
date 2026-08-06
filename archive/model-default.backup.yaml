@@ -1,0 +1,6 @@
+# Резервная копия перед переключением на Luna
+# Сохранён: 2026-07-11
+model:
+  default: '@preset/dsv4flash'
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1

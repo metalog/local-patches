@@ -1,0 +1,68 @@
+From 427ca493ef5b2a0b9f81a8d8209a031dc8392988 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@vps-111ad8da.vps.ovh.net>
+Date: Thu, 9 Apr 2026 19:13:24 +0000
+Subject: [PATCH] fix: skip sudo password prompts when nopasswd sudo works
+
+---
+ tools/terminal_tool.py | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 0dc0fd58..15b0fbfd 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -110,6 +110,8 @@ def _check_disk_usage_warning():
+ 
+ # Session-cached sudo password (persists until CLI exits)
+ _cached_sudo_password: str = ""
++# Cache whether passwordless sudo already works for the current user.
++_sudo_nopass_available: bool | None = None
+ 
+ # Optional UI callbacks for interactive prompts. When set, these are called
+ # instead of the default /dev/tty or input() readers. The CLI registers these
+@@ -442,6 +444,27 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, bool]:
+     return "".join(out), found
+ 
+ 
++def _passwordless_sudo_available() -> bool:
++    """Return True when the current user can run sudo non-interactively."""
++    global _sudo_nopass_available
++    if _sudo_nopass_available is not None:
++        return _sudo_nopass_available
++    try:
++        import subprocess
++        result = subprocess.run(
++            ["sudo", "-n", "true"],
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            timeout=5,
++            check=False,
++        )
++        _sudo_nopass_available = (result.returncode == 0)
++    except Exception:
++        _sudo_nopass_available = False
++    return _sudo_nopass_available
++
++
+ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None]:
+     """
+     Transform sudo commands to use -S flag if SUDO_PASSWORD is available.
+@@ -484,6 +507,14 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
+     if not has_real_sudo:
+         return command, None
+ 
++    # Respect explicit non-interactive sudo and do not rewrite it to sudo -S.
++    if re.search(r'\bsudo\s+(?:--non-interactive\b|-n\b)', command):
++        return command, None
++
++    # If passwordless sudo already works for this user, never prompt.
++    if _passwordless_sudo_available():
++        return command, None
++
+     has_configured_password = "SUDO_PASSWORD" in os.environ
+     sudo_password = os.environ.get("SUDO_PASSWORD", "") if has_configured_password else _cached_sudo_password
+ 
+-- 
+2.43.0
+
