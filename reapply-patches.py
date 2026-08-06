@@ -1,58 +1,14 @@
 #!/usr/bin/env python3
 """Reapply local Hermes patches that need to survive `hermes update`."""
 
-import re
-import subprocess
 import sys
 from pathlib import Path
 
 repo = Path.home() / ".hermes" / "hermes-agent"
-gateway_path = repo / "gateway" / "run.py"
 
 # ---------------------------------------------------------------------------
-# Sudo fix #3 — _systemctl_cmd in hermes_cli/gateway.py
-# Makes `hermes gateway restart/status/stop` use sudo -n instead of polkit
-# ---------------------------------------------------------------------------
-cli_gateway_path = repo / "hermes_cli" / "gateway.py"
-text = cli_gateway_path.read_text()
-orig = text
-
-old = (
-    'def _systemctl_cmd(system: bool = False) -> list[str]:\n'
-    '    if not system:\n'
-    '        _ensure_user_systemd_env()\n'
-    '    return ["systemctl"] if system else ["systemctl", "--user"]\n'
-    '\n'
-    '\n'
-    'def _journalctl_cmd(system: bool = False) -> list[str]:'
-)
-new = (
-    'def _systemctl_cmd(system: bool = False) -> list[str]:\n'
-    '    if not system:\n'
-    '        _ensure_user_systemd_env()\n'
-    '        return ["systemctl", "--user"]\n'
-    '    # System-scope runs via sudo -n (passwordless) to avoid polkit auth prompt\n'
-    '    return ["sudo", "-n", "systemctl"]\n'
-    '\n'
-    '\n'
-    'def _journalctl_cmd(system: bool = False) -> list[str]:'
-)
-# Idempotent — nothing to do if already present
-if old in text:
-    text = text.replace(old, new, 1)
-cli_gateway_changed = text != orig
-if cli_gateway_changed:
-    cli_gateway_path.write_text(text)
-
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Telegram audio documents — classify .aac/.m4a/... document uploads as audio
-# so the agent receives an audio attachment note with a marker.
-# WITHOUT this: .aac → DOCUMENT → run.py skips both AUDIO and VOICE paths
-# (line 9346: MessageType.AUDIO check fails; line 9348: DOCUMENT excluded) →
-# no marker → msg='' → agent sees empty turn → no pipeline.
-# WITH this: .aac → AUDIO → audio_file_paths → marker added → skill triggers.
+# Telegram audio documents — classify audio document uploads as audio so the
+# normal inbound audio path can preserve the attachment context for the agent.
 # ---------------------------------------------------------------------------
 telegram_path = repo / "plugins" / "platforms" / "telegram" / "adapter.py"
 if not telegram_path.exists():
@@ -95,16 +51,10 @@ telegram_audio_documents_changed = text != orig
 if telegram_audio_documents_changed:
     telegram_path.write_text(text)
 
-# Post-send typing — upstream has the notify-gated fix built in (see #48678).
-telegram_post_send_typing_changed = False
-telegram_post_send_typing_changed = False
-
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 patched = []
-if cli_gateway_changed:
-    patched.append("hermes_cli/gateway.py (systemctl sudo)")
 if telegram_audio_documents_changed:
     patched.append("plugins/platforms/telegram/adapter.py (audio documents as audio)")
 
