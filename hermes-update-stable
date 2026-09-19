@@ -138,6 +138,13 @@ fi
 GATEWAY_UNIT="hermes-gateway.service"
 GATEWAY_WAS_ACTIVE=0
 GATEWAY_MASKED=0
+cleanup_gateway_mask() {
+    if (( GATEWAY_MASKED )); then
+        sudo -n systemctl unmask "$GATEWAY_UNIT" || true
+        GATEWAY_MASKED=0
+    fi
+}
+trap cleanup_gateway_mask EXIT
 if sudo -n systemctl is-active --quiet "$GATEWAY_UNIT"; then
     GATEWAY_WAS_ACTIVE=1
     echo "==> Masking $GATEWAY_UNIT against Restart=always races"
