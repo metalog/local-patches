@@ -135,11 +135,16 @@ else
     echo "==> Checkout is clean; no source-tree stash needed"
 fi
 
+GATEWAY_UNIT="hermes-gateway.service"
 GATEWAY_WAS_ACTIVE=0
-if sudo -n systemctl is-active --quiet hermes-gateway; then
+GATEWAY_MASKED=0
+if sudo -n systemctl is-active --quiet "$GATEWAY_UNIT"; then
     GATEWAY_WAS_ACTIVE=1
-    echo "==> Stopping hermes-gateway before changing the live checkout"
-    sudo -n systemctl stop hermes-gateway
+    echo "==> Masking $GATEWAY_UNIT against Restart=always races"
+    sudo -n systemctl mask --runtime "$GATEWAY_UNIT"
+    GATEWAY_MASKED=1
+    echo "==> Stopping $GATEWAY_UNIT before changing the live checkout"
+    sudo -n systemctl stop "$GATEWAY_UNIT"
 fi
 
 refresh_system_gateway() {
@@ -168,6 +173,10 @@ refresh_system_gateway() {
 UPDATE_SUCCEEDED=0
 finish() {
     local rc=$?
+    if (( GATEWAY_MASKED )); then
+        sudo -n systemctl unmask "$GATEWAY_UNIT" || true
+        GATEWAY_MASKED=0
+    fi
     if (( UPDATE_SUCCEEDED )); then
         if (( GATEWAY_WAS_ACTIVE )); then
             echo "==> Refreshing systemd unit and starting hermes-gateway"
