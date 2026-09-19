@@ -1,7 +1,8 @@
 # Hermes local patch set
 
 This repository is the source of truth for local Hermes changes. The live checkout under
-`~/.hermes/hermes-agent` is disposable: `/home/ubuntu/bin/hermes-update-stable` stashes it,
+`~/.hermes/hermes-agent` is disposable: `/home/ubuntu/bin/hermes-update-stable` is a launcher
+for the versioned `hermes-update-stable` script in this repository; it stashes the checkout,
 checks out an exact stable tag, and runs `reapply-patches.py` before starting the gateway.
 
 `reapply-patches.py` is deliberately fail-closed. If an upstream release changes the
