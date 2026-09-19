@@ -1,0 +1,88 @@
+diff --git a/tests/tools/test_mcp_structured_content.py b/tests/tools/test_mcp_structured_content.py
+index 43df4ed901..1d953b6fd2 100644
+--- a/tests/tools/test_mcp_structured_content.py
++++ b/tests/tools/test_mcp_structured_content.py
+@@ -60,7 +60,17 @@ def _patch_mcp_server():
+     # `_rpc_lock` is acquired by _make_tool_handler's call path (mcp_tool.py
+     # ~L2008) to serialize JSON-RPC against the server — build it inside the
+     # fresh loop that _fake_run_on_mcp_loop spins up, not at fixture import.
+-    fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
++    fake_server = SimpleNamespace(
++        session=fake_session,
++        _rpc_lock=None,
++        _refresh_tools=AsyncMock(),
++        _tools=[
++            SimpleNamespace(
++                name="my-tool",
++                annotations=SimpleNamespace(readOnlyHint=True, idempotentHint=True),
++            )
++        ],
++    )
+     with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
+          patch("tools.mcp_tool_loop._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
+         yield fake_session
+@@ -113,6 +123,64 @@ class TestStructuredContentPreservation:
+         assert data["result"] == payload
+ 
+ 
++class TestSchemaRefreshRecovery:
++    def test_stale_output_schema_refreshes_and_retries_once(self, _patch_mcp_server):
++        """A post-deploy outputSchema mismatch self-heals without a restart."""
++        session = _patch_mcp_server
++        session.call_tool = AsyncMock(
++            side_effect=[
++                RuntimeError(
++                    "Invalid structured content returned by tool my-tool: "
++                    "Additional properties are not allowed"
++                ),
++                _FakeCallToolResult(
++                    content=[_FakeContentBlock("recovered")],
++                    structuredContent={"new_field": True},
++                ),
++            ]
++        )
++        handler = _mcp_handlers._make_tool_handler("test-server", "my-tool", 30.0)
++
++        data = json.loads(handler({}))
++
++        assert data == {"result": "recovered"}
++        assert session.call_tool.await_count == 2
++        server = mcp_tool._servers["test-server"]
++        server._refresh_tools.assert_awaited_once()
++
++    def test_non_schema_runtime_error_is_not_retried(self, _patch_mcp_server):
++        session = _patch_mcp_server
++        session.call_tool = AsyncMock(side_effect=RuntimeError("other failure"))
++        handler = _mcp_handlers._make_tool_handler("test-server", "my-tool", 30.0)
++
++        data = json.loads(handler({}))
++
++        assert "other failure" in data["error"]
++        assert session.call_tool.await_count == 1
++        server = mcp_tool._servers["test-server"]
++        server._refresh_tools.assert_not_awaited()
++
++    def test_write_tool_schema_refresh_does_not_repeat_side_effect(self, _patch_mcp_server):
++        session = _patch_mcp_server
++        server = mcp_tool._servers["test-server"]
++        server._tools[0].annotations = SimpleNamespace(
++            readOnlyHint=False,
++            idempotentHint=False,
++        )
++        session.call_tool = AsyncMock(
++            side_effect=RuntimeError(
++                "Invalid structured content returned by tool my-tool: schema mismatch"
++            )
++        )
++        handler = _mcp_handlers._make_tool_handler("test-server", "my-tool", 30.0)
++
++        data = json.loads(handler({}))
++
++        assert "schema mismatch" in data["error"]
++        assert session.call_tool.await_count == 1
++        server._refresh_tools.assert_awaited_once()
++
++
+ class TestMetaPassthrough:
+     """Server ``_meta`` is surfaced, minus protocol-reserved keys.
+ 
