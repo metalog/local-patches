@@ -230,19 +230,40 @@ mcp_split_new = '''        async def _invoke_tool_call():
                 server._mark_session_proven()
             return _render_call_tool_result(result, server_name)
 '''
+mcp_modern_old = '''        async def _call():
+            async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
+                server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
+                try:
+                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                finally:
+                    server._pending_call_context = None
+            if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
+                server._mark_session_proven()
+            return _render_call_tool_result(result, server_name)
+'''
+mcp_modern_new = mcp_split_new.replace(
+    "async with server._rpc_lock, _track_inflight_rpc(server, server_name, op):",
+    "async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):",
+)
 if mcp_sentinel not in mcp_text:
-    selected_old, selected_new = (
-        (mcp_split_old, mcp_split_new)
+    candidates = (
+        ((mcp_modern_old, mcp_modern_new), (mcp_split_old, mcp_split_new))
         if mcp_handler_layout == "split"
-        else (mcp_old, mcp_new)
+        else ((mcp_old, mcp_new),)
     )
-    if selected_old not in mcp_text:
+    selected_old = selected_new = None
+    for candidate_old, candidate_new in candidates:
+        if candidate_old in mcp_text:
+            selected_old, selected_new = candidate_old, candidate_new
+            break
+    if selected_old is None:
         print(
             "HERMES PATCH ERROR: Could not find MCP tool-call marker; "
             "review upstream schema-refresh behavior before updating",
             file=sys.stderr,
         )
         sys.exit(2)
+    assert selected_new is not None
     mcp_text = mcp_text.replace(selected_old, selected_new, 1)
 
 mcp_schema_refresh_changed = mcp_text != mcp_orig
