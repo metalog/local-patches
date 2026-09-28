@@ -3,7 +3,14 @@ set -Eeuo pipefail
 
 REPO="${HERMES_REPO:-${HOME}/.hermes/hermes-agent}"
 PATCH_SCRIPT="${HERMES_PATCH_SCRIPT:-${HOME}/.hermes/local-patches/products/hermes/reapply-patches.py}"
-UV_BIN="${UV_BIN:-$(command -v uv || true)}"
+UV_BIN="${UV_BIN:-}"
+if [[ -z "$UV_BIN" ]]; then
+    if [[ -x "${HOME}/.local/bin/uv" ]]; then
+        UV_BIN="${HOME}/.local/bin/uv"
+    else
+        UV_BIN="$(command -v uv || true)"
+    fi
+fi
 PYTHON="${HERMES_PYTHON:-${REPO}/venv/bin/python}"
 HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
 HERMES_BIN="${HERMES_BIN:-${HOME}/.local/bin/hermes}"
