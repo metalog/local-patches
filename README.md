@@ -1,20 +1,19 @@
-# Hermes local patch set
+# Local patches and overlays
 
-This repository is the source of truth for local Hermes changes. The live checkout under
-`~/.hermes/hermes-agent` is disposable: `/home/ubuntu/bin/hermes-update-stable` is a launcher
-for the versioned `hermes-update-stable` script in this repository; it stashes the checkout,
-checks out an exact stable tag, and runs `reapply-patches.py` before starting the gateway.
+This repository is the source of truth for local changes that must survive
+upstream upgrades of third-party products.
 
-`reapply-patches.py` is deliberately fail-closed. If an upstream release changes the
-surrounding code so a patch cannot be located, the update stops before the gateway is
-restarted. Run it against a candidate tag first when the upstream layout has changed.
+## Products
 
-Active code patches:
+- [`products/hermes`](products/hermes/README.md) — release-aware Hermes patches
+  and the stable update launcher.
+- [`products/cptr`](products/cptr/README.md) — Open WebUI Computer mobile
+  terminal input patch and frontend rebuild helper.
 
-- Telegram audio documents are classified as audio, preserving the normal audio inbound path.
-- MCP stale output-schema errors trigger one `tools/list` refresh and one retry only for
-  tools marked read-only or idempotent; write-capable tools are never replayed.
+Each product directory owns its patches, apply/update tooling, validation, and
+rollback notes. Product-specific deployment repositories such as
+`metalog/openhands-local` remain separate when they contain a complete runtime
+overlay rather than a small upstream patch set.
 
-The files under `archive/` are reviewable snapshots, not automatically applied patches.
-The MCP test snapshots are kept separately because the test module and MCP handler moved in
-`v2026.9.14`; the `v2026.9.14` snapshot was run successfully (21 tests in that module).
+The Hermes symlinks at the repository root are temporary compatibility entry
+points for older installations.

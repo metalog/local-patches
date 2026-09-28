@@ -1,0 +1,126 @@
+diff --git a/cptr/frontend/src/lib/components/ShortcutBar.svelte b/cptr/frontend/src/lib/components/ShortcutBar.svelte
+index 3ef8882..2a418f5 100644
+--- a/cptr/frontend/src/lib/components/ShortcutBar.svelte
++++ b/cptr/frontend/src/lib/components/ShortcutBar.svelte
+@@ -30,26 +30,6 @@
+ 		return () => window.visualViewport?.removeEventListener('resize', check);
+ 	});
+ 
+-	// When Ctrl is held, intercept the NEXT keypress before xterm gets it
+-	$effect(() => {
+-		if (!ctrlHeld) return;
+-
+-		function interceptKey(e: KeyboardEvent) {
+-			if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+-				e.preventDefault();
+-				e.stopPropagation();
+-				e.stopImmediatePropagation();
+-				const code = String.fromCharCode(e.key.toUpperCase().charCodeAt(0) - 64);
+-				window.dispatchEvent(new CustomEvent('cptr:terminal-input', { detail: code }));
+-				ctrlHeld = false;
+-			}
+-		}
+-
+-		// Use capture phase to get the event before xterm
+-		window.addEventListener('keydown', interceptKey, true);
+-		return () => window.removeEventListener('keydown', interceptKey, true);
+-	});
+-
+ 	function sendKey(key: string) {
+ 		window.dispatchEvent(new CustomEvent('cptr:terminal-input', { detail: key }));
+ 	}
+@@ -113,12 +93,23 @@
+ 
+ 	function toggleCtrl() {
+ 		ctrlHeld = !ctrlHeld;
++		(window as any).__cptrTerminalCtrlHeld = ctrlHeld;
++		window.dispatchEvent(new CustomEvent('cptr:terminal-ctrl', { detail: ctrlHeld }));
+ 	}
+ 
+ 	$effect(() => {
+ 		if (!visible && dictating) stopDictation();
+ 	});
+ 
++	$effect(() => {
++		function syncCtrl(e: Event) {
++			ctrlHeld = Boolean((e as CustomEvent).detail);
++			(window as any).__cptrTerminalCtrlHeld = ctrlHeld;
++		}
++		window.addEventListener('cptr:terminal-ctrl', syncCtrl);
++		return () => window.removeEventListener('cptr:terminal-ctrl', syncCtrl);
++	});
++
+ 	$effect(() => {
+ 		return () => stopDictation();
+ 	});
+diff --git a/cptr/frontend/src/lib/components/Terminal.svelte b/cptr/frontend/src/lib/components/Terminal.svelte
+index 12ef07b..d1e9f1a 100644
+--- a/cptr/frontend/src/lib/components/Terminal.svelte
++++ b/cptr/frontend/src/lib/components/Terminal.svelte
+@@ -310,7 +310,31 @@
+ 
+ 		fitAddon = new FitAddon();
+ 		term.loadAddon(fitAddon);
+-		term.open(containerEl);
++		// Android predictive keyboards keep xterm's hidden textarea in an IME
++		// composition until Enter. A password input disables that composition
++		// and restores immediate, character-by-character terminal input.
++		const useDirectMobileInput = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
++		const originalCreateElement = document.createElement.bind(document);
++		if (useDirectMobileInput) {
++			(document as any).createElement = (tagName: string, options?: ElementCreationOptions) => {
++				if (tagName.toLowerCase() === 'textarea') {
++					const input = originalCreateElement('input', options);
++					input.type = 'password';
++					input.autocomplete = 'one-time-code';
++					input.name = 'cptr-terminal-input';
++					input.setAttribute('data-form-type', 'other');
++					input.setAttribute('data-lpignore', 'true');
++					input.setAttribute('data-1p-ignore', 'true');
++					return input;
++				}
++				return originalCreateElement(tagName, options);
++			};
++		}
++		try {
++			term.open(containerEl);
++		} finally {
++			if (useDirectMobileInput) (document as any).createElement = originalCreateElement;
++		}
+ 		if (initialOutput) term.write(initialOutput);
+ 		// // iOS: Move xterm's textarea from inside .xterm-helpers (position:absolute,
+ 		// // offscreen) to a flex sibling BELOW the terminal.
+@@ -339,6 +363,17 @@
+ 		// This prevents duplicate SIGWINCH signals that cause rich CLI apps
+ 		// (e.g. Claude Code, htop) to render content twice.
+ 		term.onData((data: string) => {
++			// Android Firefox soft keyboards often bypass keydown and feed text
++			// straight into xterm. Honour the sticky Ctrl shortcut here as well.
++			if ((window as any).__cptrTerminalCtrlHeld && data.length > 0) {
++				const charCode = data[0].toUpperCase().charCodeAt(0);
++				if (charCode >= 64 && charCode <= 95) {
++					(window as any).__cptrTerminalCtrlHeld = false;
++					window.dispatchEvent(new CustomEvent('cptr:terminal-ctrl', { detail: false }));
++					sendInput(String.fromCharCode(charCode - 64) + data.slice(1));
++					return;
++				}
++			}
+ 			sendInput(data);
+ 		});
+ 
+@@ -440,9 +475,14 @@
+ 			sendInput(data);
+ 		}
+ 		window.addEventListener('cptr:terminal-input', handleShortcutInput);
+-
++		function handleShortcutCtrl(e: Event) {
++			(window as any).__cptrTerminalCtrlHeld = Boolean((e as CustomEvent).detail);
++			if ((e as CustomEvent).detail) term?.focus();
++		}
++		window.addEventListener('cptr:terminal-ctrl', handleShortcutCtrl);
+ 		return () => {
+ 			window.removeEventListener('cptr:terminal-input', handleShortcutInput);
++			window.removeEventListener('cptr:terminal-ctrl', handleShortcutCtrl);
+ 			document.removeEventListener('touchstart', onTouchStart);
+ 			document.removeEventListener('touchmove', onTouchMove);
+ 			document.removeEventListener('touchend', onTouchEnd);
