@@ -1,0 +1,129 @@
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index e56bec6b93..75bb8c84d6 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -1311,6 +1311,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
+         if _reply is not None:
+             return _reply
+ 
++        # A root-DM request owns a new topic, not the user's last-active lane.
++        # Do this after authorization/control replies but before busy/key lookup.
++        if not await self._prepare_telegram_topic_request(event):
++            return self._telegram_topic_root_lobby_message()
++        source = event.source
++        _quick_key = self._session_key_for_source(source)
++
+         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
+         self._hm_evict_idle_stale_agent(_quick_key)
+         if self._is_session_running(_quick_key):
+diff --git a/gateway/run_topics.py b/gateway/run_topics.py
+index 2d01dee33a..9cc0b4f69a 100644
+--- a/gateway/run_topics.py
++++ b/gateway/run_topics.py
+@@ -164,32 +164,38 @@ class GatewayTopicThreadsMixin:
+             logger.debug("telegram topic binding refresh failed (%s)", reason, exc_info=True)
+ 
+     def _recover_telegram_topic_thread_id(self, source: SessionSource) -> Optional[str]:
+-        """Pin lobby-shaped topic-mode DM replies (missing ``message_thread_id`` or General) to the
+-        user's most-recent bound topic. Never rewrite a non-lobby, unbound thread id: a brand-new DM
+-        topic is also "unknown" until its first message is recorded. None = leave the source alone."""
+-        if (
+-            not self._is_telegram_dm(source) or not source.chat_id or not source.user_id
+-            or not self._telegram_topic_mode_enabled(source)
+-        ):
+-            return None
+-        inbound = str(source.thread_id or "")
+-        if inbound and inbound not in self._TELEGRAM_GENERAL_TOPIC_IDS:
+-            return None
+-        session_db = self._sync_session_db()
+-        if session_db is None:
+-            return None
++        """Never infer a transport route from binding recency.
++
++        A missing/General thread identifies the root chat, not the last session.
++        Keep the hook for adapter compatibility; explicit Telegram topic IDs
++        (including previously unbound ones) remain authoritative.
++        """
++        return None
++
++    async def _prepare_telegram_topic_request(self, event: MessageEvent) -> bool:
++        """Create a fresh lane for an admitted root request, before busy/session lookup.
++
++        False means creation failed: the caller must stop, never execute in the
++        root session or reuse an existing topic. Commands and internal wakes
++        retain their existing control routes. No prompt is sent to a title LLM.
++        """
++        source = event.source
++        if (event.internal or event.get_command()
++                or not await asyncio.to_thread(self._is_telegram_topic_root_lobby, source)):
++            return True
++        adapter = self._delivery_adapter_for(source)
++        create_topic = getattr(adapter, "_create_dm_topic", None)
++        if not callable(create_topic):
++            return False
+         try:
+-            bindings = session_db.list_telegram_topic_bindings_for_chat(
+-                chat_id=str(source.chat_id), profile_name=self._telegram_topic_profile_name(source)
+-            )
++            thread_id = await create_topic(int(source.chat_id), t("gateway.topic.default_title"))
+         except Exception:
+-            logger.debug("topic-recover: read failed", exc_info=True)
+-            return None
+-        for b in bindings or ():  # newest-first
+-            if str(b.get("user_id") or "") == str(source.user_id):
+-                recovered = str(b.get("thread_id") or "")
+-                return recovered if recovered and recovered != inbound else None
+-        return None
++            logger.warning("Failed to create Telegram request topic", exc_info=True)
++            return False
++        if not thread_id or str(thread_id) in self._TELEGRAM_GENERAL_TOPIC_IDS:
++            return False
++        event.source = replace_source(source, thread_id=str(thread_id))
++        return True
+ 
+     # ── Telegram topic mode: /topic activation helpers ──────────────────────────────────────
+ 
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index af5b60cff6..a0c3b4e5df 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -5881,6 +5881,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+         is_topic_message = bool(getattr(message, "is_topic_message", False))
+         is_group = chat_type in ("group", "supergroup")
+         is_forum_group = is_group and getattr(chat, "is_forum", False) is True
++        # Some DM replies omit their own topic field. Only the explicit
++        # replied-to message in this same chat can supply it, never DB recency.
++        if chat_type == "private" and (raw is None or str(raw) == "1" or not is_topic_message):
++            reply = getattr(message, "reply_to_message", None)
++            reply_chat = getattr(reply, "chat", None)
++            reply_thread = getattr(reply, "message_thread_id", None)
++            if (reply_chat is not None and getattr(reply_chat, "id", None) == getattr(chat, "id", None)
++                    and getattr(reply, "is_topic_message", False) is True
++                    and reply_thread is not None and str(reply_thread) != "1"):
++                return str(reply_thread)
+         if raw is not None:
+             if is_forum_group or (is_group and is_topic_message) or (chat_type == "private" and is_topic_message):
+                 return str(raw)
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index eaa0febd3a..3b602cccbc 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3602,8 +3602,8 @@ class BasePlatformAdapter(ABC):
+     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
+         """Call the handler and send its reply inline, with retry, threading and
+         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
+-        thread_meta = _thread_metadata_for_event(event)
+         response = await self._message_handler(event)
++        thread_meta = _thread_metadata_for_event(event)
+         text, eph_ttl = self._unwrap_ephemeral(response)
+         if not text:
+             return
+@@ -4597,7 +4600,7 @@ class BasePlatformAdapter(ABC):
+                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
+                 text_content, media_files = extracted.text_content, extracted.media_files
+                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
+-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
++                _final_thread_metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
+                 _tts_paths, _tts_requested_path = [], None
+                 if self._wants_auto_tts(
+                         event, session_key, interrupt_event, text_content, media_files):

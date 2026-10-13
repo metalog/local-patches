@@ -18,7 +18,7 @@ DRY_RUN=0
 
 usage() {
     cat <<'EOF'
-Usage: hermes-update-stable [--plan] [vYYYY.M.D[.N]|latest]
+Usage: hermes-update-stable [--plan] [vMAJOR.MINOR.PATCH|vYYYY.M.D[.N]|latest]
 
 Update Hermes to one explicit annotated release tag.
 This command never follows main/trunk and never restores the old source-tree
@@ -59,7 +59,7 @@ for arg in "$@"; do
     esac
 done
 TAG="${TAG:-latest}"
-if [[ "$TAG" != "latest" && ! "$TAG" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+if [[ "$TAG" != "latest" && ! "$TAG" =~ ^v[0-9]{1,3}\.[0-9]+\.[0-9]+$ && ! "$TAG" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
     echo "Refusing non-release tag: $TAG" >&2
     exit 2
 fi
@@ -88,13 +88,12 @@ fi
 git_cmd() { git -C "$REPO" "$@"; }
 
 if [[ "$TAG" == "latest" ]]; then
-    TAG="$(
-        git_cmd ls-remote --tags --refs origin "refs/tags/v*" |
-            awk -F/ "{print \$3}" |
-            grep -E "^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?\$" |
-            sort -V |
-            tail -n 1 || true
-    )"
+    RELEASE_TAGS="$(git_cmd ls-remote --tags --refs origin "refs/tags/v*" | awk -F/ '{print $3}')"
+    # Prefer stable SemVer; historical calendar tags sort above every SemVer.
+    TAG="$(printf '%s\n' "$RELEASE_TAGS" | grep -E '^v[0-9]{1,3}\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+    if [[ -z "$TAG" ]]; then
+        TAG="$(printf '%s\n' "$RELEASE_TAGS" | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' | sort -V | tail -n 1 || true)"
+    fi
     if [[ -z "$TAG" ]]; then
         echo "Could not resolve the latest stable release tag from origin" >&2
         exit 1
@@ -161,28 +160,18 @@ if sudo -n systemctl is-active --quiet "$GATEWAY_UNIT"; then
     sudo -n systemctl stop "$GATEWAY_UNIT"
 fi
 
+# The existing units run as ubuntu and bootstrap the selected PM generation.
+# Starting them through systemd avoids creating root-owned PM state via sudo CLI.
 refresh_system_gateway() {
-    NODE_BIN_DIR=""
-    NODE_BIN="$(command -v node || true)"
-    if [[ -n "$NODE_BIN" ]]; then
-        NODE_BIN_DIR="$(dirname "$(readlink -f "$NODE_BIN")")"
-    fi
-    SERVICE_PATH="${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    if [[ -n "$NODE_BIN_DIR" ]]; then
-        SERVICE_PATH="${NODE_BIN_DIR}:${SERVICE_PATH}"
-    fi
-    sudo -n /usr/bin/env \
-        "PATH=${SERVICE_PATH}" \
-        "HERMES_HOME=${HERMES_HOME}" \
-        "$HERMES_BIN" gateway restart --system
-    if [[ -d "${HERMES_HOME}/backups/config" ]]; then
-        # The root-only --system refresh can create one config snapshot as root;
-        # the gateway itself runs as the invoking user and must be able to rotate it.
-        RUN_UID="$(id -u)"
-        RUN_GID="$(id -g)"
-        sudo -n /usr/bin/chown -R "${RUN_UID}:${RUN_GID}" "${HERMES_HOME}/backups/config"
-    fi
+    sudo -n systemctl daemon-reload
+    sudo -n systemctl start "$GATEWAY_UNIT"
 }
+
+DASHBOARD_WAS_ACTIVE=0
+if sudo -n systemctl is-active --quiet hermes-dashboard.service; then
+    DASHBOARD_WAS_ACTIVE=1
+    sudo -n systemctl stop hermes-dashboard.service
+fi
 
 UPDATE_SUCCEEDED=0
 finish() {
@@ -195,6 +184,9 @@ finish() {
         if (( GATEWAY_WAS_ACTIVE )); then
             echo "==> Refreshing systemd unit and starting hermes-gateway"
             refresh_system_gateway
+        fi
+        if (( DASHBOARD_WAS_ACTIVE )); then
+            sudo -n systemctl start hermes-dashboard.service
         fi
         echo "Stable update completed: $TAG"
         echo "Local source changes remain parked in ${STASH_REF:-no stash}."
@@ -216,17 +208,25 @@ git_cmd switch --detach "$TAG"
 echo "==> Installing dependencies into Hermes venv"
 (
     cd "$REPO"
-    "$UV_BIN" pip install --python "$PYTHON" --editable '.[all]'
+    if [[ -d "$REPO/pm" ]]; then
+        "$PYTHON" -c 'import pm; from pm.client import ensure_tools_for_sync; ensure_tools_for_sync(); pm.sync_venv(["all", "telegram"], explicit=True)'
+    else
+        "$UV_BIN" pip install --python "$PYTHON" --editable '.[all]'
+    fi
 )
 
 echo "==> Reapplying Hermes-local patches"
-"$PATCH_SCRIPT"
+HERMES_REPO="$REPO" "$PATCH_SCRIPT"
 
 echo "==> Validating checkout"
-"$PYTHON" -m compileall -q \
-    "$REPO/hermes_cli" \
-    "$REPO/plugins/platforms/telegram/adapter.py"
+(
+    cd "$REPO"
+    # Validate with the selected PM interpreter without writing old user/root bytecode caches.
+    "$PYTHON" -c 'import hermes_bootstrap; import ast; from pathlib import Path; root=Path.cwd(); paths=list((root/"hermes_cli").rglob("*.py"))+[root/"plugins/platforms/telegram/adapter.py", root/"gateway/delivery_ledger.py", root/"gateway/run_startup.py", root/"gateway/platforms/base.py"]; [ast.parse(p.read_text(encoding="utf-8"), filename=str(p)) for p in paths]'
+)
 git_cmd diff --check
+# Apply supported schema migrations without prompting for optional credentials.
+"$PYTHON" -c 'import hermes_bootstrap; from hermes_cli.config import migrate_config; migrate_config(interactive=False, quiet=True)'
 if ! CONFIG_STATUS="$("$HERMES_BIN" config check 2>&1)"; then
     printf "%s\n" "$CONFIG_STATUS" >&2
     echo "Config check failed; refusing to restart the gateway." >&2
@@ -236,6 +236,15 @@ if printf "%s\n" "$CONFIG_STATUS" | grep -Eq "Config version:.*→|new config op
     printf "%s\n" "$CONFIG_STATUS" >&2
     echo "Config migration is required; review and run hermes config migrate before restarting." >&2
     exit 1
+fi
+
+if (( DASHBOARD_WAS_ACTIVE )) && [[ -d "$REPO/pm" ]]; then
+    echo "==> Building current dashboard assets"
+    (cd "$REPO"; "$PYTHON" -c 'import hermes_bootstrap; from pathlib import Path; from hermes_cli.main_web_build import _build_web_ui; assert _build_web_ui(Path.cwd()/"web", fatal=True)')
+fi
+
+if [[ -d "$REPO/pm" ]]; then
+    "$HERMES_BIN" update --set-channel stable
 fi
 
 UPDATE_SUCCEEDED=1

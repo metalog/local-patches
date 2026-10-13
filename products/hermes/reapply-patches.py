@@ -2,10 +2,36 @@
 """Reapply local Hermes patches that need to survive `hermes update`."""
 
 import os
+import shutil
+import tempfile
+import subprocess
 import sys
 from pathlib import Path
 
 repo = Path(os.environ.get("HERMES_REPO", Path.home() / ".hermes" / "hermes-agent")).expanduser()
+
+# Validate the complete patch chain on a source-only copy before touching any
+# target. A late conflict must not leave audio/MCP/delivery half patched.
+if os.environ.get("HERMES_PATCH_PREFLIGHT") != "1":
+    with tempfile.TemporaryDirectory(prefix="hermes-patch-preflight-", dir=os.environ.get("TMPDIR")) as directory:
+        candidate = Path(directory)
+        for relative in ("plugins/platforms/telegram/adapter.py", "gateway/platforms/telegram.py",
+                         "tools/mcp_tool.py", "tools/mcp_tool_handlers.py",
+                         "gateway/delivery_ledger.py", "gateway/platforms/base.py",
+                         "gateway/run_startup.py", "gateway/run_topics.py", "gateway/run_inbound.py",
+                         "hermes_cli/main.py"):
+            source = repo / relative
+            if source.exists():
+                target = candidate / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+        check = subprocess.run([sys.executable, str(Path(__file__).resolve())],
+            env={**os.environ, "HERMES_REPO": str(candidate), "HERMES_PATCH_PREFLIGHT": "1"},
+            capture_output=True, text=True)
+        if check.returncode:
+            print("HERMES PATCH ERROR: preflight failed; target checkout unchanged", file=sys.stderr)
+            print(check.stderr, file=sys.stderr)
+            sys.exit(check.returncode)
 
 # ---------------------------------------------------------------------------
 # Telegram audio documents — classify audio document uploads as audio so the
@@ -245,9 +271,18 @@ mcp_modern_new = mcp_split_new.replace(
     "async with server._rpc_lock, _track_inflight_rpc(server, server_name, op):",
     "async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):",
 )
+# v0.21.6 adds native image delivery; retain its per-attempt image cache reset.
+mcp_native_old = mcp_modern_old.replace(
+    "            return _render_call_tool_result(result, server_name)\n",
+    "            image_paths.clear()\n            return _render_call_tool_result(result, server_name, image_paths)\n",
+)
+mcp_native_new = mcp_modern_new.replace(
+    "            return _render_call_tool_result(result, server_name)\n",
+    "            image_paths.clear()\n            return _render_call_tool_result(result, server_name, image_paths)\n",
+)
 if mcp_sentinel not in mcp_text:
     candidates = (
-        ((mcp_modern_old, mcp_modern_new), (mcp_split_old, mcp_split_new))
+        ((mcp_native_old, mcp_native_new), (mcp_modern_old, mcp_modern_new), (mcp_split_old, mcp_split_new))
         if mcp_handler_layout == "split"
         else ((mcp_old, mcp_new),)
     )
@@ -270,10 +305,60 @@ mcp_schema_refresh_changed = mcp_text != mcp_orig
 if mcp_schema_refresh_changed:
     mcp_tool_path.write_text(mcp_text)
 
+# Keep delivery routing across durable retries (normal finals and restart recovery).
+delivery_routing_changed = False
+delivery_patch = Path(__file__).with_name("delivery-routing.patch")
+if delivery_patch.exists() and (repo / "gateway" / "delivery_ledger.py").exists():
+    command = ["git", "-C", str(repo), "apply"]
+    applied = subprocess.run(command + ["--reverse", "--check", str(delivery_patch)], capture_output=True)
+    if applied.returncode != 0:
+        check = subprocess.run(command + ["--check", str(delivery_patch)], capture_output=True, text=True)
+        if check.returncode != 0:
+            print("HERMES PATCH ERROR: Delivery routing patch needs review against this release", file=sys.stderr)
+            print(check.stderr, file=sys.stderr)
+            sys.exit(2)
+        subprocess.run(command + [str(delivery_patch)], check=True)
+        delivery_routing_changed = True
+
+# Telegram request routing is mandatory for this gateway layout. Exact forward
+# or reverse checks only: upstream changes require human review, never fuzz.
+telegram_routing_changed = False
+if (repo / "gateway" / "run_topics.py").exists():
+    routing_patch = Path(__file__).with_name("telegram-request-routing.patch")
+    if not routing_patch.is_file():
+        print("HERMES PATCH ERROR: Telegram routing patch missing", file=sys.stderr)
+        sys.exit(2)
+    command = ["git", "-C", str(repo), "apply"]
+    applied = subprocess.run(command + ["--reverse", "--check", str(routing_patch)], capture_output=True)
+    if applied.returncode:
+        check = subprocess.run(command + ["--check", str(routing_patch)], capture_output=True, text=True)
+        if check.returncode:
+            print("HERMES PATCH ERROR: Telegram routing conflicts with target release", file=sys.stderr)
+            print(check.stderr, file=sys.stderr)
+            sys.exit(2)
+        subprocess.run(command + [str(routing_patch)], check=True)
+        telegram_routing_changed = True
+
+# Install the CLI/module update guard as part of the same atomic preflight.
+main_path = repo / "hermes_cli/main.py"
+if main_path.exists():
+    main_text = main_path.read_text()
+    if "# HERMES_LOCAL_UPDATE_POLICY" not in main_text:
+        marker = '    """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""\n'
+        guard = '    # HERMES_LOCAL_UPDATE_POLICY: external policy survives checkout replacement.\n    import runpy\n    policy = Path.home() / ".hermes/local-patches/products/hermes/update-policy.py"\n    if not policy.is_file():\n        raise SystemExit("Local update policy missing; refusing update")\n    if runpy.run_path(str(policy))["route"](args, PROJECT_ROOT):\n        return\n'
+        if main_text.count(marker) != 1:
+            print("HERMES PATCH ERROR: Native update entry changed; refusing update", file=sys.stderr)
+            sys.exit(2)
+        main_path.write_text(main_text.replace(marker, marker + guard, 1))
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 patched = []
+if telegram_routing_changed:
+    patched.append("Telegram requests (new root topic/session; no last-topic recovery)")
+if delivery_routing_changed:
+    patched.append("gateway delivery ledger (preserve routing and accurate retry marker)")
 if telegram_audio_documents_changed:
     patched.append("plugins/platforms/telegram/adapter.py (audio documents as audio)")
 if mcp_schema_refresh_changed:

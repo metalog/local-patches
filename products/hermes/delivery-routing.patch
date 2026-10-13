@@ -1,0 +1,176 @@
+diff --git a/gateway/delivery_ledger.py b/gateway/delivery_ledger.py
+index 3f0cc681b6..14b0646b17 100644
+--- a/gateway/delivery_ledger.py
++++ b/gateway/delivery_ledger.py
+@@ -13,6 +13,7 @@ best-effort: ledger failures must never block a send; callers wrap every call in
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import logging
+ import os
+ import re
+@@ -39,8 +40,8 @@ _MAX_ROWS = 500
+ # post-rejection retry) — honest at-least-once. Runtime recovery uses a distinct marker: no restart
+ # occurred, but a network rejection's acknowledgement can still have been lost independently.
+ RECOVERED_MARKER = "♻️ Recovered reply — the gateway restarted during delivery, so this may be a duplicate:\n\n"
+-RECONNECTED_MARKER = ("♻️ Recovered reply — the messaging platform reconnected after the original "
+-                      "delivery failed, so this may be a duplicate:\n\n")
++RECONNECTED_MARKER = ("♻️ Recovered reply — the original delivery failed and was retried, "
++                      "so this may be a duplicate:\n\n")
+ # A reply refused by flood control may have gone out as several requests (the adapter chunks long replies,
+ # and MarkdownV2 escaping alone can push a reply that fits one message into two), and the platform may have
+ # accepted the first chunk(s) before refusing the rest; the send result does not say which landed. The raw
+@@ -204,6 +205,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
+             adapter_profile TEXT
+         )"""
+     )
++    add_column_if_missing(conn, "delivery_obligations", "delivery_context", "delivery_context TEXT")
+     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+ 
+@@ -268,18 +270,20 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
+ 
+ 
+ def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
++                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
++                      metadata: Optional[Dict[str, Any]] = None, reply_to: Optional[str] = None) -> None:
+     """Record a final response as owed to the platform (state='pending')."""
+     now, (pid, started) = time.time(), _owner_stamp()
++    context = json.dumps({"metadata": metadata, "reply_to": reply_to}) if metadata is not None or reply_to is not None else None
+     with _DB_LOCK, _transaction() as conn:
+         conn.execute(
+             """INSERT OR REPLACE INTO delivery_obligations
+                (obligation_id, session_key, platform, chat_id, thread_id,
+                 content, state, attempts, created_at, updated_at,
+-                owner_pid, owner_started_at, adapter_profile)
+-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
++                owner_pid, owner_started_at, adapter_profile, delivery_context)
++               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
+             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
++             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default", context))
+         # Same transaction, same connection: the cron ledgers prune this way too
+         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
+         _prune_unlocked(conn, now)
+@@ -351,7 +355,7 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
+ 
+ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
+                  needs_marker: bool, runtime: bool = False, flood: bool = False,
+-                 last_error: Optional[str] = None) -> Dict[str, Any]:
++                 last_error: Optional[str] = None, delivery_context: Optional[str] = None) -> Dict[str, Any]:
+     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
+     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
+     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
+@@ -360,6 +364,7 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
+     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
+     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
+             "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
++            **(json.loads(delivery_context) if delivery_context else {}),
+             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
+             **({"runtime_recovery": True} if runtime else {}),
+             **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
+@@ -391,12 +396,12 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
+         rows = conn.execute(
+             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                       content, state, attempts, created_at,
+-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
++                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at, delivery_context
+                FROM delivery_obligations
+                WHERE state IN ('pending', 'attempting', 'failed')"""
+         ).fetchall()
+         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
+-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
++             owner_pid, owner_started_at, adapter_profile, last_error, updated_at, delivery_context) in rows:
+             if _owner_alive(owner_pid, owner_started_at):
+                 continue  # a live gateway still owns this row
+             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+@@ -442,7 +447,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
+                 # the marker.
+                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
+                                             adapter_profile or "default",
+-                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row))
++                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row,
++                                            delivery_context=delivery_context))
+     return claimed
+ 
+ 
+@@ -467,11 +473,11 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
+         rows = conn.execute(
+             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                       content, attempts, created_at, owner_pid,
+-                      owner_started_at, last_error, adapter_profile, updated_at
++                      owner_started_at, last_error, adapter_profile, updated_at, delivery_context
+                FROM delivery_obligations
+                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
+         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
+-             owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
++             owner_pid, owner_started_at, last_error, adapter_profile, updated_at, delivery_context) in rows:
+             # Exact process-start matching prevents PID reuse from stealing work.
+             if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
+                 continue
+@@ -501,7 +507,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
+                 # claim released unsent keeps its flood retry eligibility.
+                 claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
+                                             attempts, adapter_profile, needs_marker=True, runtime=True,
+-                                            flood=is_flood_error(last_error), last_error=last_error))
++                                            flood=is_flood_error(last_error), last_error=last_error,
++                                            delivery_context=delivery_context))
+     return claimed
+ 
+ 
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index eaa0febd3a..d721f07646 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -4244,7 +4244,8 @@ class BasePlatformAdapter(ABC):
+ 
+     async def _record_delivery_obligation(
+         self, event: MessageEvent, session_key: str, text_content: str,
+-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
++        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
++        metadata: Optional[Dict[str, Any]] = None, reply_to: Optional[str] = None) -> Optional[str]:
+         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
+         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
+         or None."""
+@@ -4269,7 +4270,8 @@ class BasePlatformAdapter(ABC):
+                 platform=str(getattr(source.platform, "value", source.platform)),
+                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
+                 content=text_content,
+-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
++                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
++                **({"metadata": metadata, "reply_to": reply_to} if metadata is not None or reply_to is not None else {}))
+             await asyncio.to_thread(mark_attempting, obligation_id)
+             return obligation_id
+         except Exception:
+@@ -4390,7 +4392,8 @@ class BasePlatformAdapter(ABC):
+         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
+                     len(text_content), event.source.chat_id)
+         obligation_id = await self._record_delivery_obligation(
+-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
++            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
++            metadata=metadata, reply_to=reply_to)
+         if obligation_id is not None:
+             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
+         result = await delivery_adapter._send_with_retry(
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index 902d47d195..e1ece9d0df 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -465,9 +465,13 @@ class GatewayStartupMixin:
+             content = row["content"]
+             if row.get("needs_marker"):
+                 content = row.get("marker", RECOVERED_MARKER) + content
+-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
++            # Replay the original route: a Telegram DM topic's anchor and flags
++            # must survive, or a thread-not-found retry can escape into the root chat.
++            metadata = row["metadata"] if "metadata" in row else (
++                {"thread_id": row["thread_id"]} if row.get("thread_id") else None)
++            reply_kwargs = {"reply_to": row["reply_to"]} if "reply_to" in row else {}
+             try:
+-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
++                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata, **reply_kwargs)
+             except Exception as send_err:
+                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
+                 result = None

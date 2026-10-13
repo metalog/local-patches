@@ -1,0 +1,29 @@
+diff --git a/tests/tools/test_mcp_structured_content.py b/tests/tools/test_mcp_structured_content.py
+index cd5bd4e25c..fa40fca546 100644
+--- a/tests/tools/test_mcp_structured_content.py
++++ b/tests/tools/test_mcp_structured_content.py
+@@ -347,3 +347,24 @@ class TestDroppedBlockNotice:
+         data = json.loads(handler({}))
+         assert data["structuredContent"] == payload
+         assert "[MCP content dropped" in data["result"]
++
++
++@pytest.mark.parametrize("read_only,idempotent", [(True, False), (False, True), (False, False)])
++def test_local_schema_refresh_replays_only_safe_calls(_patch_mcp_server, read_only, idempotent):
++    session = _patch_mcp_server
++    server = mcp_tool._servers["test-server"]
++    server._refresh_tools = AsyncMock()
++    server._tools = [SimpleNamespace(
++        name="my-tool", annotations=SimpleNamespace(readOnlyHint=read_only, idempotentHint=idempotent))]
++    session.call_tool = AsyncMock(side_effect=[
++        RuntimeError("Invalid structured content returned by tool my-tool: schema mismatch"),
++        _FakeCallToolResult([_FakeContentBlock("recovered")]),
++    ])
++    result = json.loads(_mcp_handlers._make_tool_handler("test-server", "my-tool", 30.0)({}))
++    server._refresh_tools.assert_awaited_once()
++    if read_only or idempotent:
++        assert result == {"result": "recovered"}
++        assert session.call_tool.await_count == 2
++    else:
++        assert "schema mismatch" in result["error"]
++        assert session.call_tool.await_count == 1

@@ -1,0 +1,39 @@
+diff --git a/tests/gateway/test_delivery_ledger_producer.py b/tests/gateway/test_delivery_ledger_producer.py
+index 645e79951d..9c50183b62 100644
+--- a/tests/gateway/test_delivery_ledger_producer.py
++++ b/tests/gateway/test_delivery_ledger_producer.py
+@@ -211,3 +211,34 @@ class TestProducerHook:
+         claimed = dl.sweep_recoverable()
+         assert len(claimed) == 1
+         assert claimed[0]["needs_marker"] is True
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("recovery", ["runtime", "boot"])
++async def test_final_route_survives_durable_redelivery(monkeypatch, recovery):
++    import time
++    from gateway.run import GatewayRunner
++    monkeypatch.setattr(dl, "ledger_enabled", lambda: True)
++    monkeypatch.setattr(dl, "_owner_stamp", lambda: (12345, 99))
++    monkeypatch.setattr(dl, "_owner_alive", lambda *args: False)
++    adapter = _Adapter()
++    adapter.platform = Platform.TELEGRAM
++    event = MessageEvent(text="hello", message_type=MessageType.TEXT, message_id="600",
++        source=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="500"))
++    metadata = {"thread_id": "500", "telegram_dm_topic_reply_fallback": True,
++        "telegram_reply_to_message_id": "600", "direct_messages_topic_id": "500", "hermes_profile": "default"}
++    adapter._send_with_retry = AsyncMock(return_value=SendResult(success=False, error="Message thread not found"))
++    await adapter.send_final_ledgered(event, "agent:main:telegram:dm:123:500", "answer", metadata, reply_to="600")
++    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="601"))
++    runner = object.__new__(GatewayRunner)
++    runner.adapters = {Platform.TELEGRAM: adapter}
++    runner._profile_adapters = {}
++    runner._active_profile_name = lambda: "default"
++    claimed = dl.sweep_failed_for_runtime("telegram", now=time.time()+31) if recovery == "runtime" else dl.sweep_recoverable()
++    assert len(claimed) == 1
++    assert await runner._redeliver_claimed_obligations(claimed) == 1
++    kwargs = adapter.send.call_args.kwargs
++    assert kwargs["metadata"] == metadata
++    assert kwargs["reply_to"] == "600"
++    if recovery == "runtime":
++        assert "reconnected" not in kwargs["content"]
