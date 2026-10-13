@@ -1,4 +1,41 @@
 """Root requests must never inherit the latest Telegram topic."""
+
+import pytest
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reply_mode', ['first', 'off'])
+async def test_real_create_send_pipeline_never_replies_into_root(tmp_path, reply_mode):
+    from tests.gateway.test_telegram_thread_fallback import _make_adapter
+    from gateway.platforms.base import _thread_metadata_for_event
+    from gateway.session_identity import replace_source
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    _seed_two_topic_bindings(db)
+    runner = _make_runner(db)
+    adapter = _make_adapter()
+    adapter._reply_to_mode = reply_mode
+    adapter._bot = SimpleNamespace(
+        create_forum_topic=AsyncMock(return_value=SimpleNamespace(message_thread_id=333)),
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=999)))
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _make_event('synthetic root request')
+    event.message_id = '42'
+    event.source = replace_source(event.source, message_id='42')
+    assert await runner._prepare_telegram_topic_request(event)
+    metadata = _thread_metadata_for_event(event)
+    # Exercise actual adapter chunk delivery, including explicit inbound reply anchor.
+    result = await adapter._send_chunk_with_retries(
+        event.source.chat_id, 'synthetic answer', 0, '42', metadata,
+        event.source.thread_id, False, adapter._telegram_error_types())
+    assert isinstance(result, tuple)
+    wire = adapter._bot.send_message.await_args.kwargs
+    assert wire['reply_to_message_id'] is None
+    assert wire['message_thread_id'] == 333
+    assert 'direct_messages_topic_id' not in wire
+    adapter._bot.create_forum_topic.assert_awaited_once()
+    # Source copies retain routing provenance for final delivery/session resolution.
+    assert _thread_metadata_for_event(SimpleNamespace(source=replace_source(event.source),
+        reply_to_message_id=None, message_id='42')) == metadata
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 

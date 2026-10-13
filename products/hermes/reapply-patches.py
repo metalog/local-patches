@@ -18,7 +18,7 @@ if os.environ.get("HERMES_PATCH_PREFLIGHT") != "1":
         for relative in ("plugins/platforms/telegram/adapter.py", "gateway/platforms/telegram.py",
                          "tools/mcp_tool.py", "tools/mcp_tool_handlers.py",
                          "gateway/delivery_ledger.py", "gateway/platforms/base.py",
-                         "gateway/run_startup.py", "gateway/run_topics.py", "gateway/run_inbound.py",
+                         "gateway/run_startup.py", "gateway/run_topics.py", "gateway/run_inbound.py", "gateway/session.py",
                          "hermes_cli/main.py"):
             source = repo / relative
             if source.exists():
